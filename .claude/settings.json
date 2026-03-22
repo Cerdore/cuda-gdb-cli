@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Write(/Users/cerdore/gitRepo/cuda-gdb-cli/**)",
+      "Edit(/Users/cerdore/gitRepo/cuda-gdb-cli/**)",
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(mkdir:*)",
+      "Bash(ls:*)",
+      "Bash(touch:*)"
+    ]
+  }
+}
