@@ -1,814 +1,1318 @@
-# CUDA-GDB CLI — 面向 AI Agent 的 CUDA 调试命令行工具
+# CUDA-GDB CLI — 基于 gdb-cli 扩展的 CUDA 调试工具
 
-## 0. 设计哲学
+## 0. 设计策略：Fork gdb-cli，扩展 CUDA 支持
 
-**一句话概括：AI Agent 通过 bash 命令直接操控 `cuda-gdb`，像人类在终端里调试一样简单。**
+### 0.1 为什么 fork 而不是从头写
 
-不需要 RPC 服务器，不需要 JSON-RPC 协议栈，不需要 MCP。只需要一个 CLI 工具管理 `cuda-gdb` 进程的生命周期，Agent 发 bash 命令，拿回文本结果，继续推理，再发下一条命令。
+[gdb-cli](https://github.com/Cerdore/gdb-cli) 是一个已经成熟的、面向 AI Agent 的 GDB 调试 CLI 工具。它的架构经过验证，核心能力完备：
+
+| gdb-cli 已有能力                         | 说明                                                          |
+| ---------------------------------------- | ------------------------------------------------------------- |
+| **thin CLI + GDB 内嵌 Python RPC** | 比 pexpect 可靠 10 倍，直接用 GDB Python API                  |
+| **结构化 JSON 输出**               | `gdb.Value` → JSON 递归序列化，Agent 解析零歧义            |
+| **会话管理**                       | Unix Socket + named FIFO 保活，幂等性，心跳超时自动清理       |
+| **安全白名单**                     | readonly / readwrite / full 三级，attach 生产进程时的安全保障 |
+| **16 个语义化 handler**            | bt, threads, eval, locals, memory, disasm, ptype 等           |
+| **Claude Code Skill**              | 自带 SKILL.md，`bunx skills add` 一键安装                   |
+
+**我们需要做的只是 CUDA 差异化的 20%**，而不是重新造 80% 的轮子。
+
+### 0.2 CUDA 扩展的核心差异
+
+`cuda-gdb` 是 `gdb` 的超集。所有 GDB 命令在 `cuda-gdb` 中都可用，但 CUDA 额外引入了以下维度：
+
+| 维度               | GDB (CPU)          | CUDA-GDB (GPU)                                        |
+| ------------------ | ------------------ | ----------------------------------------------------- |
+| **线程模型** | OS 线程（pthread） | GPU 线程：Grid → Block → Thread（三维坐标）         |
+| **硬件坐标** | 无                 | Device → SM → Warp → Lane                          |
+| **焦点切换** | `thread N`       | `cuda kernel K block (x,y,z) thread (x,y,z)`        |
+| **内存空间** | 统一地址空间       | `@global` / `@shared` / `@local` / `@generic` |
+| **异常类型** | SIGSEGV, SIGFPE 等 | CUDA_EXCEPTION_WARP_ASSERT, LANE_ILLEGAL_ADDRESS 等   |
+| **执行单元** | 进程               | Kernel（<<<grid, block>>>）                           |
+| **寄存器**   | rax, rbx, rip 等   | GPU 寄存器（R0-R255），数量因架构而异                 |
+
+### 0.3 改动范围总览
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  AI Agent (Claude Code / Codex CLI / Cursor / ...)  │
-│                                                     │
-│  工具：bash shell                                    │
-│  能力：发送任意 shell 命令，读取 stdout/stderr       │
-└──────────────────────┬──────────────────────────────┘
+gdb-cli (upstream)
+├── src/gdb_cli/
+│   ├── cli.py              ← 新增 CUDA 子命令
+│   ├── client.py           ← 无需改动（通用 Unix Socket 客户端）
+│   ├── launcher.py         ← gdb → cuda-gdb，新增 CUDA 启动参数
+│   ├── session.py          ← 新增 CUDA 元数据字段
+│   ├── safety.py           ← 新增 CUDA 命令白名单
+│   ├── formatters.py       ← 无需改动
+│   ├── errors.py           ← 新增 CUDA 错误类型
+│   ├── env_check.py        ← 新增 CUDA 环境检查
+│   └── gdb_server/
+│       ├── gdb_rpc_server.py   ← 新增 CUDA handler 注册
+│       ├── handlers.py         ← 新增 8 个 CUDA handler
+│       ├── value_formatter.py  ← 扩展 @shared/@global 地址空间
+│       └── heartbeat.py        ← 无需改动
+└── skills/
+    └── cuda-gdb-cli/           ← 新增 CUDA 调试 Skill
+        └── SKILL.md
+```
+
+---
+
+## 1. 架构：继承 gdb-cli 的 thin CLI + 内嵌 RPC
+
+### 1.1 整体架构（与 gdb-cli 一致）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  AI Agent (Claude Code / Codex CLI / Cursor / ...)      │
+│  工具：bash shell                                        │
+└──────────────────────┬──────────────────────────────────┘
                        │  bash 命令
                        ▼
-┌─────────────────────────────────────────────────────┐
-│  cuda-gdb-cli (Python CLI 脚本)                     │
-│                                                     │
-│  • 管理 cuda-gdb 子进程生命周期                      │
-│  • 将 Agent 的命令转发给 cuda-gdb                    │
-│  • 捕获输出并返回给 Agent                            │
-│  • 可选：结构化 JSON 输出                            │
-└──────────────────────┬──────────────────────────────┘
-                       │  stdin/stdout (pexpect)
+┌─────────────────────────────────────────────────────────┐
+│  cuda-gdb-cli (Python CLI, Click)                       │
+│                                                         │
+│  • 解析命令行参数                                        │
+│  • 通过 Unix Socket 连接 RPC Server                      │
+│  • 输出结构化 JSON                                       │
+└──────────────────────┬──────────────────────────────────┘
+                       │  Unix Domain Socket (JSON)
                        ▼
-┌─────────────────────────────────────────────────────┐
-│  cuda-gdb 进程                                      │
-│                                                     │
-│  NVIDIA 官方 CUDA 调试器                             │
-│  支持 GPU 线程、共享内存、Warp 异常等                │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  cuda-gdb 进程 (常驻后台)                                │
+│                                                         │
+│  ┌───────────────────────────────────────────────┐      │
+│  │  GDB Python RPC Server (内嵌)                  │      │
+│  │                                               │      │
+│  │  后台线程: Unix Socket accept/recv/send        │      │
+│  │  主线程:   gdb.execute() / gdb.parse_and_eval()│      │
+│  │                                               │      │
+│  │  Handlers:                                    │      │
+│  │    ├── CPU: bt, threads, eval, locals, ...    │      │
+│  │    └── CUDA: cuda_threads, cuda_kernels,      │      │
+│  │             cuda_focus, cuda_memory, ...       │      │
+│  └───────────────────────────────────────────────┘      │
+│                                                         │
+│  NVIDIA cuda-gdb (GDB 超集)                              │
+│  支持 GPU 线程、共享内存、Warp 异常等                     │
+└─────────────────────────────────────────────────────────┘
 ```
+
+### 1.2 关键技术决策（继承自 gdb-cli）
+
+| 决策                   | 方案                                                          | 原因                                |
+| ---------------------- | ------------------------------------------------------------- | ----------------------------------- |
+| **GDB 交互方式** | GDB Python API（`gdb.execute()`, `gdb.parse_and_eval()`） | 比 pexpect 可靠，无提示符误匹配问题 |
+| **进程间通信**   | Unix Domain Socket                                            | 简单可靠，无需 HTTP/TCP 开销        |
+| **进程保活**     | named FIFO 作为 stdin                                         | GDB 阻塞在读端，不退出              |
+| **输出格式**     | 始终 JSON                                                     | Agent 解析准确率高                  |
+| **会话管理**     | 文件系统持久化 + 幂等性                                       | 同 PID/Core 复用 session            |
+| **安全机制**     | 命令白名单 + 心跳超时                                         | 防止误操作和进程泄漏                |
 
 ---
 
-## 1. 核心交互模型
-
-### 1.1 Agent 视角：就是发 bash 命令
-
-Agent 不需要学习任何新协议。它只需要会用 `bash` 工具：
-
-```bash
-# 启动调试会话（加载 coredump）
-cuda-gdb-cli start --core /path/to/core --exec /path/to/app
-
-# 启动调试会话（attach 到进程）
-cuda-gdb-cli start --exec /path/to/app --args "--batch-size 64"
-
-# 发送调试命令
-cuda-gdb-cli send "info cuda threads"
-cuda-gdb-cli send "cuda thread (1,0,0)"
-cuda-gdb-cli send "bt"
-cuda-gdb-cli send "print shared_mem[threadIdx.x]"
-
-# 批量发送多条命令
-cuda-gdb-cli send "break kernel.cu:42" "run" "info cuda threads"
-
-# 查看会话状态
-cuda-gdb-cli status
-
-# 结束会话
-cuda-gdb-cli stop
-```
-
-**就这么简单。** Agent 的 System Prompt 里告诉它有 `cuda-gdb-cli` 这个工具可用，它就能自主调试 CUDA 程序。
-
-### 1.2 与 Claude Code 的集成方式
-
-Claude Code 的 Agent 可以直接通过 `bash` 工具调用 `cuda-gdb-cli`：
-
-```
-User: "帮我分析这个 CUDA coredump，找出崩溃原因"
-
-Agent 思考: 我需要用 cuda-gdb-cli 加载 coredump 并分析
-
-Agent 执行:
-  bash: cuda-gdb-cli start --core ./core.12345 --exec ./my_cuda_app
-  → 输出: "Session started. cuda-gdb ready. Mode: coredump"
-
-  bash: cuda-gdb-cli send "bt"
-  → 输出: "#0 kernel<<<(1,1,1),(256,1,1)>>> at kernel.cu:42 ..."
-
-  bash: cuda-gdb-cli send "info cuda threads"
-  → 输出: "  BlockIdx ThreadIdx ... Exception ..."
-
-  bash: cuda-gdb-cli send "cuda thread (1,0,0)" "print idx"
-  → 输出: "idx = 1024"  (越界!)
-
-Agent 回答: "崩溃原因是 kernel.cu:42 行的数组越界访问，
-            线程 (1,0,0) 的 idx=1024 超出了数组边界..."
-```
-
----
-
-## 2. CLI 命令设计
+## 2. 新增 CUDA 子命令设计
 
 ### 2.1 命令总览
 
-| 命令       | 用途                    | 示例                                               |
-| ---------- | ----------------------- | -------------------------------------------------- |
-| `start`  | 启动 cuda-gdb 会话      | `cuda-gdb-cli start --core dump.core --exec app` |
-| `send`   | 发送一条或多条 GDB 命令 | `cuda-gdb-cli send "bt" "info locals"`           |
-| `status` | 查看当前会话状态        | `cuda-gdb-cli status`                            |
-| `stop`   | 终止会话，清理进程      | `cuda-gdb-cli stop`                              |
+在 gdb-cli 原有命令基础上，新增以下 CUDA 特有子命令：
 
-只有 4 个子命令，Agent 零学习成本。
+| 命令                | 用途                                            | 对应 cuda-gdb 命令            |
+| ------------------- | ----------------------------------------------- | ----------------------------- |
+| `cuda-threads`    | 列出 GPU 线程（按 Block/Thread 坐标）           | `info cuda threads`         |
+| `cuda-kernels`    | 列出活跃 Kernel                                 | `info cuda kernels`         |
+| `cuda-focus`      | 查看/切换 GPU 焦点（kernel/block/thread）       | `cuda kernel/block/thread`  |
+| `cuda-devices`    | 查看 GPU 设备拓扑                               | `info cuda devices`         |
+| `cuda-exceptions` | 查看 CUDA 异常                                  | `info cuda exceptions`      |
+| `cuda-memory`     | 读取 GPU 地址空间内存（@shared/@global/@local） | `print @space type[N] expr` |
+| `cuda-warps`      | 查看 Warp 级状态                                | `info cuda warps`           |
+| `cuda-lanes`      | 查看 Lane 级状态                                | `info cuda lanes`           |
 
-### 2.2 `start` — 启动调试会话
+**原有 gdb-cli 命令全部保留**（`load`, `attach`, `bt`, `threads`, `eval-cmd`, `locals-cmd`, `exec`, `memory`, `disasm` 等），它们在 `cuda-gdb` 中同样可用，用于 CPU 端调试。
 
-```
-cuda-gdb-cli start [OPTIONS]
-
-OPTIONS:
-  --exec PATH          可执行文件路径（必需）
-  --core PATH          Coredump 文件路径（coredump 模式）
-  --pid PID            Attach 到运行中的进程（attach 模式）
-  --args "ARGS"        传给被调试程序的参数（live 模式）
-  --cuda-gdb PATH      cuda-gdb 可执行文件路径（默认从 PATH 查找）
-  --timeout SECONDS    命令超时时间（默认 30s）
-  --session-id ID      指定会话 ID（默认自动生成）
-  --json               输出 JSON 格式
-```
-
-**三种启动模式：**
+### 2.2 `cuda-threads` — GPU 线程列表
 
 ```bash
-# 模式 1: Coredump 分析（只读）
-cuda-gdb-cli start --exec ./app --core ./core.12345
+cuda-gdb-cli cuda-threads -s $SESSION [OPTIONS]
 
-# 模式 2: Attach 到运行中进程
-cuda-gdb-cli start --exec ./app --pid 12345
-
-# 模式 3: 启动新进程调试
-cuda-gdb-cli start --exec ./app --args "--input data.bin"
+OPTIONS:
+  --kernel K           按 Kernel 过滤
+  --block "x,y,z"      按 Block 过滤
+  --limit N            最大返回数量（默认 50）
+  --range "START-END"  线程范围
 ```
 
-**输出示例（纯文本）：**
-
-```
-[cuda-gdb-cli] Session started
-  Session ID : s_a1b2c3
-  Mode       : coredump
-  Executable : /home/user/app
-  Core       : /home/user/core.12345
-  cuda-gdb   : /usr/local/cuda/bin/cuda-gdb
-  Status     : ready
-```
-
-**输出示例（JSON，`--json`）：**
+**输出示例：**
 
 ```json
 {
-  "status": "ok",
-  "session_id": "s_a1b2c3",
-  "mode": "coredump",
-  "executable": "/home/user/app",
-  "core": "/home/user/core.12345"
-}
-```
-
-### 2.3 `send` — 发送调试命令
-
-```
-cuda-gdb-cli send [OPTIONS] COMMAND [COMMAND ...]
-
-OPTIONS:
-  --session-id ID      指定会话（单会话时可省略）
-  --timeout SECONDS    本次命令超时（覆盖默认值）
-  --json               输出 JSON 格式
-```
-
-**单条命令：**
-
-```bash
-cuda-gdb-cli send "info cuda threads"
-```
-
-**输出（纯文本，直接透传 cuda-gdb 的原始输出）：**
-
-```
-  BlockIdx  ThreadIdx  To  Name  Filename  Line
-* (0,0,0)  (0,0,0)    -   kern  kernel.cu  42
-  (0,0,0)  (1,0,0)    -   kern  kernel.cu  42
-  (0,0,0)  (2,0,0)    -   kern  kernel.cu  42
-```
-
-**批量命令：**
-
-```bash
-cuda-gdb-cli send "cuda thread (1,0,0)" "bt" "info locals"
-```
-
-**输出（每条命令的输出用分隔线隔开）：**
-
-```
->>> cuda thread (1,0,0)
-[Switching focus to CUDA kernel 0, grid 1, block (0,0,0), thread (1,0,0)]
-
->>> bt
-#0  kernel<<<(1,1,1),(256,1,1)>>> (data=0x7fff..., n=1024) at kernel.cu:42
-#1  0x00007ffff7... in ?? ()
-
->>> info locals
-idx = 1024
-data = 0x7fffdeadbeef
-n = 1024
-```
-
-**JSON 输出（`--json`）：**
-
-```json
-{
-  "status": "ok",
-  "results": [
+  "cuda_threads": [
     {
-      "command": "cuda thread (1,0,0)",
-      "output": "[Switching focus to CUDA kernel 0, grid 1, block (0,0,0), thread (1,0,0)]"
+      "kernel": 0,
+      "block_idx": [0, 0, 0],
+      "thread_idx": [0, 0, 0],
+      "name": "matmul_kernel",
+      "file": "matmul.cu",
+      "line": 28,
+      "is_current": true,
+      "exception": null
     },
     {
-      "command": "bt",
-      "output": "#0  kernel<<<(1,1,1),(256,1,1)>>> ..."
-    },
-    {
-      "command": "info locals",
-      "output": "idx = 1024\ndata = 0x7fffdeadbeef\nn = 1024"
+      "kernel": 0,
+      "block_idx": [0, 0, 0],
+      "thread_idx": [1, 0, 0],
+      "name": "matmul_kernel",
+      "file": "matmul.cu",
+      "line": 28,
+      "is_current": false,
+      "exception": "CUDA_EXCEPTION_LANE_ILLEGAL_ADDRESS"
     }
-  ]
+  ],
+  "total_count": 16384,
+  "truncated": true,
+  "hint": "use '--kernel 0 --block 0,0,0' to narrow down"
 }
 ```
 
-### 2.4 `status` — 查看会话状态
+### 2.3 `cuda-kernels` — 活跃 Kernel 列表
 
 ```bash
-cuda-gdb-cli status [--session-id ID] [--json]
+cuda-gdb-cli cuda-kernels -s $SESSION
 ```
 
-**输出：**
+**输出示例：**
 
-```
-[cuda-gdb-cli] Session s_a1b2c3
-  Status     : ready
-  Mode       : coredump
-  PID        : 54321 (cuda-gdb process)
-  Uptime     : 2m 34s
-  Commands   : 12 sent
+```json
+{
+  "kernels": [
+    {
+      "kernel_id": 0,
+      "function": "matmul_kernel",
+      "grid_dim": [32, 32, 1],
+      "block_dim": [16, 16, 1],
+      "device": 0,
+      "status": "running",
+      "invocation": "matmul_kernel<<<(32,32,1),(16,16,1)>>>"
+    }
+  ],
+  "count": 1
+}
 ```
 
-### 2.5 `stop` — 终止会话
+### 2.4 `cuda-focus` — GPU 焦点切换
 
 ```bash
-cuda-gdb-cli stop [--session-id ID]
-```
-
-**输出：**
-
-```
-[cuda-gdb-cli] Session s_a1b2c3 terminated.
-```
-
----
-
-## 3. 内部架构
-
-### 3.1 进程模型
-
-```
-cuda-gdb-cli (Python)
-    │
-    ├── SessionManager          # 管理会话生命周期
-    │     └── Session           # 单个调试会话
-    │           ├── pexpect.spawn(cuda-gdb)   # 子进程
-    │           ├── command_queue              # 命令队列
-    │           └── state (ready/busy/dead)    # 状态
-    │
-    ├── CommandRouter           # 解析 CLI 参数，路由到对应 Session
-    │
-    └── OutputFormatter         # 格式化输出（text / json）
-```
-
-### 3.2 会话状态文件
-
-每个会话在 `/tmp/cuda-gdb-cli/` 下维护一个状态文件，实现跨命令调用的会话持久化：
-
-```
-/tmp/cuda-gdb-cli/
-  └── s_a1b2c3/
-        ├── session.json        # 会话元信息
-        ├── cuda-gdb.pid        # cuda-gdb 进程 PID
-        └── socket               # Unix Domain Socket（进程间通信）
-```
-
-**为什么需要这个？** 因为每次 `cuda-gdb-cli send` 都是一个独立的 CLI 进程调用。我们需要一种机制让多次 CLI 调用共享同一个 `cuda-gdb` 进程。
-
-### 3.3 进程间通信方案
-
-```
-                    首次 start                    后续 send
-                    ─────────                    ─────────
-cuda-gdb-cli ──→ 启动 Daemon 进程 ──→ spawn cuda-gdb
-                  监听 Unix Socket
-                       ▲
-                       │ Unix Socket
-cuda-gdb-cli ──────────┘
-  (send 命令)    连接 Daemon，发送命令，接收结果
-```
-
-**Daemon 进程**：`cuda-gdb-cli start` 时 fork 一个后台 Daemon，它持有 `cuda-gdb` 子进程。后续的 `send` 命令通过 Unix Domain Socket 与 Daemon 通信。
-
-这样 Agent 每次调用 `cuda-gdb-cli send` 都是一个短生命周期的 CLI 进程，但底层的 `cuda-gdb` 会话是持久的。
-
-### 3.4 核心类设计
-
-```python
-class CudaGdbDaemon:
-    """后台 Daemon，持有 cuda-gdb 进程"""
-
-    def __init__(self, exec_path, core_path=None, pid=None, args=None):
-        self.session_id = generate_session_id()
-        self.gdb_process = None       # pexpect.spawn 实例
-        self.socket_path = f"/tmp/cuda-gdb-cli/{self.session_id}/socket"
-        self.mode = "coredump" | "attach" | "live"
-
-    def start(self):
-        """启动 cuda-gdb 子进程"""
-        cmd = self._build_cuda_gdb_command()
-        self.gdb_process = pexpect.spawn(cmd, timeout=30)
-        self._wait_for_prompt()       # 等待 (cuda-gdb) 提示符
-        self._start_socket_server()   # 开始监听 Unix Socket
-
-    def execute_command(self, command: str) -> str:
-        """向 cuda-gdb 发送命令并返回输出"""
-        self.gdb_process.sendline(command)
-        self.gdb_process.expect(r'\(cuda-gdb\)\s*')  # 等待下一个提示符
-        return self.gdb_process.before.decode()
-
-    def stop(self):
-        """终止 cuda-gdb 进程，清理资源"""
-        self.gdb_process.sendline("quit")
-        self.gdb_process.close()
-        cleanup_session_files(self.session_id)
-
-
-class CudaGdbClient:
-    """CLI 前端，通过 Unix Socket 与 Daemon 通信"""
-
-    def __init__(self, session_id=None):
-        self.session_id = session_id or self._find_active_session()
-
-    def send(self, commands: list[str]) -> list[CommandResult]:
-        """发送命令到 Daemon 并获取结果"""
-        sock = connect_to_daemon(self.session_id)
-        results = []
-        for cmd in commands:
-            sock.send(json.dumps({"action": "execute", "command": cmd}))
-            response = json.loads(sock.recv())
-            results.append(CommandResult(cmd, response["output"]))
-        return results
-```
-
-### 3.5 提示符检测与输出捕获
-
-`cuda-gdb` 的提示符是 `(cuda-gdb) `，这是我们判断命令执行完毕的标志：
-
-```python
-# 提示符正则（兼容多种场景）
-PROMPT_PATTERN = r'\(cuda-gdb\)\s*$'
-
-# 特殊情况处理
-CONTINUE_PATTERNS = [
-    r'---Type <return> to continue',    # 分页提示 → 自动发送回车
-    r'\[New Thread',                     # 新线程通知 → 继续等待
-    r'Make breakpoint pending',          # 断点确认 → 自动回答 y
-]
-```
-
-**关键设计：自动处理交互式提示**
-
-`cuda-gdb` 有时会弹出交互式提示（如分页、确认），CLI 工具自动处理这些，不让 Agent 看到：
-
-```python
-def execute_command(self, command: str) -> str:
-    self.gdb_process.sendline(command)
-
-    output_parts = []
-    while True:
-        index = self.gdb_process.expect([
-            PROMPT_PATTERN,                          # 0: 正常结束
-            r'---Type <return> to continue',         # 1: 分页
-            r'Make breakpoint pending.*\(y or n\)',  # 2: 断点确认
-            pexpect.TIMEOUT,                         # 3: 超时
-        ])
-
-        output_parts.append(self.gdb_process.before.decode())
-
-        if index == 0:    # 命令完成
-            break
-        elif index == 1:  # 分页 → 自动翻页
-            self.gdb_process.sendline("")
-        elif index == 2:  # 断点确认 → 自动 yes
-            self.gdb_process.sendline("y")
-        elif index == 3:  # 超时
-            raise TimeoutError(f"Command timed out: {command}")
-
-    return "".join(output_parts).strip()
-```
-
----
-
-## 4. CUDA 特有调试能力
-
-### 4.1 Agent 可用的 CUDA 调试命令速查
-
-CLI 工具**不封装**这些命令，而是让 Agent 直接发送原生 `cuda-gdb` 命令。Agent 的 System Prompt 中会提供这份速查表：
-
-#### GPU 线程导航
-
-```bash
-# 查看所有 CUDA 线程
-cuda-gdb-cli send "info cuda threads"
-
-# 切换到指定 GPU 线程（软件坐标）
-cuda-gdb-cli send "cuda thread (1,0,0)"
-
-# 切换到指定 Block
-cuda-gdb-cli send "cuda block (2,0,0)"
-
-# 切换到指定 Kernel
-cuda-gdb-cli send "cuda kernel 0"
-
 # 查看当前焦点
-cuda-gdb-cli send "cuda thread"
+cuda-gdb-cli cuda-focus -s $SESSION
+
+# 切换到指定 GPU 线程
+cuda-gdb-cli cuda-focus -s $SESSION --kernel 0 --block "0,0,0" --thread "1,0,0"
+
+# 只切换 Block
+cuda-gdb-cli cuda-focus -s $SESSION --block "2,3,0"
+
+# 只切换 Thread
+cuda-gdb-cli cuda-focus -s $SESSION --thread "15,0,0"
 ```
 
-#### GPU 内存检查
+**输出示例：**
+
+```json
+{
+  "focus": {
+    "kernel": 0,
+    "block_idx": [0, 0, 0],
+    "thread_idx": [1, 0, 0],
+    "device": 0,
+    "sm": 7,
+    "warp": 0,
+    "lane": 1
+  },
+  "frame": {
+    "function": "matmul_kernel",
+    "file": "matmul.cu",
+    "line": 28,
+    "address": "0x7f4a3c001234"
+  }
+}
+```
+
+### 2.5 `cuda-devices` — GPU 设备拓扑
 
 ```bash
-# 查看共享内存
-cuda-gdb-cli send "print @shared float[32] shared_data"
-
-# 查看全局内存
-cuda-gdb-cli send "print @global int[10] global_array"
-
-# 查看局部变量
-cuda-gdb-cli send "info locals"
-
-# 查看寄存器
-cuda-gdb-cli send "info registers"
+cuda-gdb-cli cuda-devices -s $SESSION
 ```
 
-#### 断点与执行控制
+**输出示例：**
+
+```json
+{
+  "devices": [
+    {
+      "device_id": 0,
+      "name": "NVIDIA A100-SXM4-80GB",
+      "sm_count": 108,
+      "compute_capability": "8.0",
+      "is_current": true
+    }
+  ],
+  "count": 1
+}
+```
+
+### 2.6 `cuda-exceptions` — CUDA 异常信息
 
 ```bash
-# 在 CUDA kernel 中设置断点
-cuda-gdb-cli send "break kernel.cu:42"
-
-# 条件断点（只在特定线程触发）
-cuda-gdb-cli send "break kernel.cu:42 if threadIdx.x == 0"
-
-# 运行 / 继续 / 单步
-cuda-gdb-cli send "run"
-cuda-gdb-cli send "continue"
-cuda-gdb-cli send "next"
-cuda-gdb-cli send "step"
+cuda-gdb-cli cuda-exceptions -s $SESSION
 ```
 
-#### 异常与崩溃分析
+**输出示例：**
+
+```json
+{
+  "exceptions": [
+    {
+      "kernel": 0,
+      "block_idx": [0, 0, 0],
+      "thread_idx": [1, 0, 0],
+      "exception": "CUDA_EXCEPTION_LANE_ILLEGAL_ADDRESS",
+      "description": "Illegal address accessed by GPU thread",
+      "error_pc": "0x7f4a3c001234"
+    }
+  ],
+  "count": 1
+}
+```
+
+### 2.7 `cuda-memory` — GPU 地址空间内存读取
 
 ```bash
-# 查看 CUDA 异常信息
-cuda-gdb-cli send "info cuda exceptions"
+# 读取共享内存
+cuda-gdb-cli cuda-memory -s $SESSION --space shared --expr "shared_data" --type "float" --count 32
 
-# 查看所有 Kernel
-cuda-gdb-cli send "info cuda kernels"
+# 读取全局内存
+cuda-gdb-cli cuda-memory -s $SESSION --space global --expr "d_array" --type "int" --count 10
 
-# 查看 GPU 硬件拓扑
-cuda-gdb-cli send "info cuda devices"
-
-# 反汇编崩溃点
-cuda-gdb-cli send "disassemble"
+# 读取局部内存
+cuda-gdb-cli cuda-memory -s $SESSION --space local --expr "local_buf" --type "double" --count 4
 ```
 
-### 4.2 Coredump vs Live 模式差异
+**输出示例：**
 
-| 能力           | Coredump 模式 | Live 模式 |
-| -------------- | :-----------: | :-------: |
-| 查看调用栈     |      ✅      |    ✅    |
-| 查看变量       |      ✅      |    ✅    |
-| 查看 GPU 线程  |      ✅      |    ✅    |
-| 查看共享内存   |      ✅      |    ✅    |
-| 设置断点       |      ❌      |    ✅    |
-| 单步执行       |      ❌      |    ✅    |
-| 修改变量       |      ❌      |    ✅    |
-| run / continue |      ❌      |    ✅    |
+```json
+{
+  "space": "shared",
+  "expression": "shared_data",
+  "element_type": "float",
+  "count": 32,
+  "elements": [1.0, 2.0, 3.0, 0.0, 0.0, "..."],
+  "truncated": false,
+  "address": "0x7fff00001000"
+}
+```
 
-CLI 工具在 Coredump 模式下**不做额外限制**——如果 Agent 发了不支持的命令，`cuda-gdb` 自己会报错，Agent 会看到错误信息并自行调整。这比在 CLI 层做复杂的模态守卫要简单得多。
+### 2.8 `cuda-warps` / `cuda-lanes` — Warp/Lane 级状态
+
+```bash
+cuda-gdb-cli cuda-warps -s $SESSION [--sm N]
+cuda-gdb-cli cuda-lanes -s $SESSION [--warp N]
+```
+
+**输出示例（warps）：**
+
+```json
+{
+  "warps": [
+    {
+      "warp_id": 0,
+      "sm": 7,
+      "block_idx": [0, 0, 0],
+      "status": "breakpoint",
+      "active_mask": "0xffffffff",
+      "divergent": false
+    }
+  ],
+  "count": 4
+}
+```
 
 ---
 
-## 5. 错误处理
+## 3. Handler 实现设计
 
-### 5.1 错误分类与输出
+### 3.1 CUDA Handler 注册
 
-CLI 工具的错误处理原则：**透传 cuda-gdb 的错误，只在 CLI 层处理进程级错误。**
-
-```bash
-# cuda-gdb 命令错误 → 直接透传
-$ cuda-gdb-cli send "print nonexistent_var"
-[cuda-gdb-cli] >>> print nonexistent_var
-No symbol "nonexistent_var" in current context.
-
-# CLI 层错误 → 带 [ERROR] 前缀
-$ cuda-gdb-cli send "bt"
-[ERROR] No active session. Run 'cuda-gdb-cli start' first.
-
-$ cuda-gdb-cli start --core /nonexistent/core --exec ./app
-[ERROR] Core file not found: /nonexistent/core
-
-# 超时错误
-$ cuda-gdb-cli send "some_long_command" --timeout 5
-[ERROR] Command timed out after 5s: some_long_command
-```
-
-### 5.2 进程崩溃恢复
+在 `gdb_rpc_server.py` 的 `_register_builtin_handlers()` 中新增 CUDA handler：
 
 ```python
-def execute_command(self, command: str) -> str:
-    if not self.gdb_process.isalive():
-        raise SessionDead("cuda-gdb process has terminated unexpectedly. "
-                          "Run 'cuda-gdb-cli start' to begin a new session.")
-    # ... 正常执行
+def _register_builtin_handlers(self) -> None:
+    # ... 原有 handler 注册 ...
+
+    # CUDA 特有 handler
+    self._handlers.update({
+        "cuda_threads":    cuda_handlers.handle_cuda_threads,
+        "cuda_kernels":    cuda_handlers.handle_cuda_kernels,
+        "cuda_focus":      cuda_handlers.handle_cuda_focus,
+        "cuda_devices":    cuda_handlers.handle_cuda_devices,
+        "cuda_exceptions": cuda_handlers.handle_cuda_exceptions,
+        "cuda_memory":     cuda_handlers.handle_cuda_memory,
+        "cuda_warps":      cuda_handlers.handle_cuda_warps,
+        "cuda_lanes":      cuda_handlers.handle_cuda_lanes,
+    })
 ```
 
-Agent 看到 `SessionDead` 错误后，会自行决定是否重新启动会话。
+### 3.2 核心 Handler 实现
 
-### 5.3 退出码约定
+#### `handle_cuda_threads` — 解析 `info cuda threads` 输出
 
-| 退出码 | 含义                  |
-| ------ | --------------------- |
-| 0      | 成功                  |
-| 1      | CLI 参数错误          |
-| 2      | 会话不存在 / 已终止   |
-| 3      | cuda-gdb 命令执行错误 |
-| 4      | 超时                  |
-| 5      | cuda-gdb 进程崩溃     |
+`cuda-gdb` 的 Python API 没有直接暴露 CUDA 线程信息的结构化接口，需要通过 `gdb.execute("info cuda threads", to_string=True)` 获取文本输出后解析：
+
+```python
+def handle_cuda_threads(
+    kernel: int = None,
+    block: str = None,
+    limit: int = 50,
+    range_str: str = None,
+    **kwargs
+) -> dict:
+    """
+    列出 CUDA GPU 线程
+
+    实现策略：
+    1. 执行 `info cuda threads` 获取原始文本
+    2. 正则解析每行的 BlockIdx, ThreadIdx, Kernel, File, Line 等字段
+    3. 按 kernel/block 过滤
+    4. 截断并返回 JSON
+    """
+    output = gdb.execute("info cuda threads", to_string=True)
+    threads = _parse_cuda_threads_output(output)
+
+    # 过滤
+    if kernel is not None:
+        threads = [t for t in threads if t["kernel"] == kernel]
+    if block is not None:
+        block_idx = _parse_coord(block)
+        threads = [t for t in threads if t["block_idx"] == block_idx]
+
+    total_count = len(threads)
+    truncated = total_count > limit
+    display_threads = threads[:limit]
+
+    result = {
+        "cuda_threads": display_threads,
+        "total_count": total_count,
+        "truncated": truncated
+    }
+    if truncated:
+        result["hint"] = "use '--kernel K --block x,y,z' to narrow down"
+    return result
+
+
+# info cuda threads 输出格式示例：
+#   BlockIdx  ThreadIdx  To  Name           Filename   Line
+# * (0,0,0)  (0,0,0)    -   matmul_kernel  matmul.cu  28
+#   (0,0,0)  (1,0,0)    -   matmul_kernel  matmul.cu  28
+
+CUDA_THREAD_PATTERN = re.compile(
+    r'(?P<current>\*?)\s*'
+    r'\((?P<bx>\d+),(?P<by>\d+),(?P<bz>\d+)\)\s+'
+    r'\((?P<tx>\d+),(?P<ty>\d+),(?P<tz>\d+)\)\s+'
+    r'(?P<to>\S+)\s+'
+    r'(?P<name>\S+)\s+'
+    r'(?P<file>\S+)\s+'
+    r'(?P<line>\d+)'
+)
+
+def _parse_cuda_threads_output(output: str) -> list:
+    threads = []
+    for line in output.strip().split('\n'):
+        match = CUDA_THREAD_PATTERN.search(line)
+        if match:
+            threads.append({
+                "kernel": 0,  # 从上下文推断
+                "block_idx": [int(match.group("bx")), int(match.group("by")), int(match.group("bz"))],
+                "thread_idx": [int(match.group("tx")), int(match.group("ty")), int(match.group("tz"))],
+                "name": match.group("name"),
+                "file": match.group("file"),
+                "line": int(match.group("line")),
+                "is_current": match.group("current") == "*",
+            })
+    return threads
+```
+
+#### `handle_cuda_focus` — GPU 焦点切换
+
+```python
+def handle_cuda_focus(
+    kernel: int = None,
+    block: str = None,
+    thread: str = None,
+    **kwargs
+) -> dict:
+    """
+    查看或切换 CUDA GPU 焦点
+
+    实现策略：
+    1. 如果提供了 kernel/block/thread 参数，构造 `cuda` 命令执行切换
+    2. 执行 `cuda kernel`、`cuda block`、`cuda thread` 获取当前焦点
+    3. 返回结构化的焦点信息 + 当前帧信息
+    """
+    # 执行切换
+    if kernel is not None:
+        gdb.execute(f"cuda kernel {kernel}", to_string=True)
+    if block is not None:
+        coord = _parse_coord(block)
+        gdb.execute(f"cuda block ({coord[0]},{coord[1]},{coord[2]})", to_string=True)
+    if thread is not None:
+        coord = _parse_coord(thread)
+        gdb.execute(f"cuda thread ({coord[0]},{coord[1]},{coord[2]})", to_string=True)
+
+    # 获取当前焦点
+    focus = _get_current_cuda_focus()
+
+    # 获取当前帧
+    frame = gdb.selected_frame()
+    frame_info = {
+        "function": frame.name() or "??",
+        "address": hex(frame.pc())
+    }
+    try:
+        sal = frame.sal()
+        if sal and sal.symtab:
+            frame_info["file"] = sal.symtab.filename
+            frame_info["line"] = sal.line
+    except Exception:
+        pass
+
+    return {"focus": focus, "frame": frame_info}
+
+
+def _get_current_cuda_focus() -> dict:
+    """解析当前 CUDA 焦点信息"""
+    focus = {}
+
+    # 获取软件坐标
+    for dimension in ["kernel", "block", "thread"]:
+        try:
+            output = gdb.execute(f"cuda {dimension}", to_string=True)
+            focus[dimension] = _parse_focus_output(dimension, output)
+        except gdb.error:
+            pass
+
+    # 获取硬件坐标
+    for dimension in ["device", "sm", "warp", "lane"]:
+        try:
+            output = gdb.execute(f"cuda {dimension}", to_string=True)
+            focus[dimension] = _parse_focus_output(dimension, output)
+        except gdb.error:
+            pass
+
+    return focus
+```
+
+#### `handle_cuda_memory` — GPU 地址空间内存读取
+
+```python
+def handle_cuda_memory(
+    space: str,
+    expr: str,
+    element_type: str = "int",
+    count: int = 10,
+    max_elements: int = 100,
+    **kwargs
+) -> dict:
+    """
+    读取 GPU 特定地址空间的内存
+
+    实现策略：
+    使用 cuda-gdb 的 @space 修饰符：
+      print @shared float[32] shared_data
+      print @global int[10] d_array
+
+    Args:
+        space: "shared" | "global" | "local" | "generic"
+        expr: 变量名或地址表达式
+        element_type: C 类型名（int, float, double 等）
+        count: 元素数量
+    """
+    valid_spaces = {"shared", "global", "local", "generic"}
+    if space not in valid_spaces:
+        return {"error": f"Invalid space '{space}', must be one of {valid_spaces}"}
+
+    actual_count = min(count, max_elements)
+    gdb_expr = f"@{space} {element_type}[{actual_count}] {expr}"
+
+    try:
+        val = gdb.parse_and_eval(gdb_expr)
+        elements = []
+        for i in range(actual_count):
+            try:
+                elem = val[i]
+                elements.append(format_gdb_value(elem, max_depth=1))
+            except gdb.MemoryError:
+                elements.append({"error": f"Cannot access element [{i}]"})
+                break
+
+        result = {
+            "space": space,
+            "expression": expr,
+            "element_type": element_type,
+            "count": len(elements),
+            "elements": elements,
+            "truncated": count > max_elements,
+        }
+
+        try:
+            if val.address:
+                result["address"] = hex(int(val.address))
+        except Exception:
+            pass
+
+        return result
+
+    except gdb.error as e:
+        return {"error": f"Cannot read @{space} memory: {e}"}
+```
+
+#### `handle_cuda_exceptions` — CUDA 异常解析
+
+```python
+def handle_cuda_exceptions(**kwargs) -> dict:
+    """
+    获取 CUDA 异常信息
+
+    实现策略：
+    1. 执行 `info cuda exceptions` 获取文本
+    2. 正则解析异常类型、位置、线程坐标
+    3. 对于每个异常，尝试获取 $errorpc 反汇编
+    """
+    output = gdb.execute("info cuda exceptions", to_string=True)
+    exceptions = _parse_cuda_exceptions_output(output)
+
+    # 对每个异常尝试获取更多上下文
+    for exc in exceptions:
+        if exc.get("error_pc"):
+            try:
+                disasm = gdb.execute(
+                    f"x/3i {exc['error_pc']}", to_string=True
+                )
+                exc["disassembly"] = disasm.strip()
+            except Exception:
+                pass
+
+    return {"exceptions": exceptions, "count": len(exceptions)}
+
+
+# CUDA 异常类型映射
+CUDA_EXCEPTION_MAP = {
+    "CUDA_EXCEPTION_LANE_ILLEGAL_ADDRESS": "GPU 线程访问了非法内存地址",
+    "CUDA_EXCEPTION_LANE_USER_STACK_OVERFLOW": "GPU 线程栈溢出",
+    "CUDA_EXCEPTION_DEVICE_HARDWARE_STACK_OVERFLOW": "GPU 硬件栈溢出",
+    "CUDA_EXCEPTION_WARP_ILLEGAL_INSTRUCTION": "Warp 执行了非法指令",
+    "CUDA_EXCEPTION_WARP_OUT_OF_RANGE_ADDRESS": "Warp 访问了越界地址",
+    "CUDA_EXCEPTION_WARP_MISALIGNED_ADDRESS": "Warp 访问了未对齐地址",
+    "CUDA_EXCEPTION_WARP_INVALID_ADDRESS_SPACE": "Warp 访问了无效地址空间",
+    "CUDA_EXCEPTION_WARP_INVALID_PC": "Warp 跳转到无效 PC",
+    "CUDA_EXCEPTION_WARP_HARDWARE_STACK_OVERFLOW": "Warp 硬件栈溢出",
+    "CUDA_EXCEPTION_DEVICE_ILLEGAL_ADDRESS": "Device 级非法地址访问",
+    "CUDA_EXCEPTION_WARP_ASSERT": "GPU 端 assert() 触发",
+}
+```
+
+### 3.3 GPU 寄存器处理
+
+GPU 寄存器与 CPU 不同，需要特殊处理：
+
+```python
+# 扩展 handlers.py 中的 handle_registers
+
+# GPU 寄存器没有固定名称列表，需要先探测
+# 策略：先执行 `info registers` 获取可用寄存器列表，再逐个读取
+
+def _get_cuda_registers(frame) -> list:
+    """
+    获取 CUDA GPU 寄存器
+
+    cuda-gdb 的 GPU 寄存器命名为 R0, R1, ..., R255
+    数量因 GPU 架构和 kernel 编译选项而异
+    安全策略：先 `info registers` 获取列表，再逐个读取
+    """
+    try:
+        output = gdb.execute("info registers", to_string=True)
+        regs = []
+        for line in output.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2:
+                regs.append({
+                    "name": parts[0],
+                    "value": parts[1],
+                })
+        return regs
+    except gdb.error as e:
+        return [{"error": f"Cannot read GPU registers: {e}"}]
+```
 
 ---
 
-## 6. 安装与依赖
+## 4. Launcher 改动
 
-### 6.1 依赖
+### 4.1 `gdb` → `cuda-gdb` 替换
 
+```python
+# launcher.py 改动
+
+def launch_core(
+    binary: str,
+    core: str,
+    sysroot: str = None,
+    solib_prefix: str = None,
+    source_dir: str = None,
+    timeout: int = 600,
+    gdb_path: str = "cuda-gdb",      # ← 默认改为 cuda-gdb
+    cuda_memcheck: bool = False,      # ← 新增：是否启用 memcheck 集成
+) -> GDBProcess:
+    """启动 Core 模式 cuda-gdb 进程"""
+
+    gdb_commands = [
+        "set pagination off",
+        "set print elements 0",
+        "set confirm off",
+    ]
+
+    # CUDA 特有设置
+    if cuda_memcheck:
+        gdb_commands.append("set cuda memcheck on")
+
+    # sysroot / solib-prefix（与 gdb-cli 一致）
+    if sysroot:
+        gdb_commands.append(f"set sysroot {sysroot}")
+    if solib_prefix:
+        gdb_commands.append(f"set solib-absolute-prefix {solib_prefix}")
+    if source_dir:
+        gdb_commands.append(f"directory {source_dir}")
+
+    # 加载 binary 和 core
+    gdb_commands.append(f"file {binary}")
+    gdb_commands.append(f"core-file {core}")
+
+    # 启动 RPC Server（与 gdb-cli 一致）
+    gdb_commands.extend(_build_server_commands(session))
+
+    # 构建 cuda-gdb 参数
+    gdb_args = [gdb_path, "-nx", "-q"]
+    for cmd in gdb_commands:
+        gdb_args.extend(["-ex", cmd])
+
+    _start_gdb_process(gdb_args, session)
+    # ...
+
+
+def launch_attach(
+    pid: int,
+    binary: str = None,
+    scheduler_locking: bool = True,
+    non_stop: bool = True,
+    timeout: int = 600,
+    allow_write: bool = False,
+    allow_call: bool = False,
+    gdb_path: str = "cuda-gdb",      # ← 默认改为 cuda-gdb
+    cuda_software_preemption: bool = False,  # ← 新增
+) -> GDBProcess:
+    """启动 Attach 模式 cuda-gdb 进程"""
+
+    gdb_commands = [
+        "set pagination off",
+        "set print elements 0",
+        "set confirm off",
+    ]
+
+    # CUDA 特有设置
+    if cuda_software_preemption:
+        gdb_commands.append("set cuda software_preemption on")
+
+    # ... 其余与 gdb-cli 一致
 ```
-Python >= 3.8
-pexpect >= 4.8
-cuda-gdb (随 CUDA Toolkit 安装)
-```
 
-### 6.2 安装
+### 4.2 环境检查扩展
 
-```bash
-pip install cuda-gdb-cli
+```python
+# env_check.py 扩展
 
-# 或从源码安装
-git clone https://github.com/xxx/cuda-gdb-cli.git
-cd cuda-gdb-cli
-pip install -e .
-```
+def env_check() -> dict:
+    results = {
+        "python_version": platform.python_version(),
+        "platform": platform.system(),
+    }
 
-### 6.3 验证安装
+    # 检查 cuda-gdb
+    cuda_gdb_path = shutil.which("cuda-gdb")
+    if cuda_gdb_path:
+        results["cuda_gdb_path"] = cuda_gdb_path
+        # 检查 Python 支持
+        try:
+            output = subprocess.check_output(
+                [cuda_gdb_path, "-nx", "-q", "-batch", "-ex", "python print('OK')"],
+                text=True, timeout=10
+            )
+            results["cuda_gdb_python"] = "OK" in output
+        except Exception:
+            results["cuda_gdb_python"] = False
+    else:
+        results["cuda_gdb_path"] = None
+        results["cuda_gdb_error"] = "cuda-gdb not found. Install CUDA Toolkit."
 
-```bash
-# 检查 cuda-gdb 是否可用
-cuda-gdb-cli doctor
-```
+    # 检查 CUDA 版本
+    nvcc_path = shutil.which("nvcc")
+    if nvcc_path:
+        try:
+            output = subprocess.check_output([nvcc_path, "--version"], text=True)
+            match = re.search(r"release (\d+\.\d+)", output)
+            if match:
+                results["cuda_version"] = match.group(1)
+        except Exception:
+            pass
 
-**输出：**
+    # 检查 GPU 驱动
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            output = subprocess.check_output(
+                [nvidia_smi, "--query-gpu=driver_version,name", "--format=csv,noheader"],
+                text=True
+            )
+            lines = output.strip().split('\n')
+            if lines:
+                parts = lines[0].split(',')
+                results["gpu_driver"] = parts[0].strip()
+                results["gpu_name"] = parts[1].strip() if len(parts) > 1 else "unknown"
+        except Exception:
+            pass
 
-```
-[cuda-gdb-cli] Environment Check
-  Python     : 3.10.12 ✓
-  pexpect    : 4.9.0 ✓
-  cuda-gdb   : /usr/local/cuda-12.2/bin/cuda-gdb ✓
-  CUDA       : 12.2 ✓
-  GPU Driver : 535.104.05 ✓
-  Status     : All checks passed ✓
+    return results
 ```
 
 ---
 
-## 7. Agent System Prompt 集成模板
+## 5. Value Formatter 扩展
 
-以下是给 AI Agent 的 System Prompt 片段，告诉它如何使用 `cuda-gdb-cli`：
+### 5.1 地址空间修饰符处理
+
+`cuda-gdb` 中的指针可能带有地址空间修饰符（`@shared`, `@global`, `@local`）。需要在 `value_formatter.py` 中扩展指针格式化逻辑：
+
+```python
+# value_formatter.py 扩展
+
+# CUDA 地址空间映射
+CUDA_ADDRESS_SPACES = {
+    "shared":  "@shared",
+    "global":  "@global",
+    "local":   "@local",
+    "generic": "@generic",
+}
+
+def _format_pointer(val, depth, max_depth, max_elements, max_string_len, max_fields):
+    """格式化指针（扩展 CUDA 地址空间支持）"""
+    try:
+        addr = int(val)
+        target_type = val.type.target()
+
+        result = {
+            "type": "pointer",
+            "address": hex(addr),
+            "target_type": str(target_type)
+        }
+
+        # 检测 CUDA 地址空间
+        type_str = str(val.type)
+        for space_name, space_prefix in CUDA_ADDRESS_SPACES.items():
+            if space_prefix in type_str:
+                result["address_space"] = space_name
+                break
+
+        # ... 其余逻辑与 gdb-cli 一致（NULL 检查、char* 字符串、解引用）
+
+        return result
+    except Exception as e:
+        return {"type": "pointer", "error": str(e)}
+```
+
+---
+
+## 6. Safety 扩展
+
+### 6.1 CUDA 命令白名单
+
+在 `safety.py` 中扩展 CUDA 特有命令的安全分类：
+
+```python
+# safety.py 扩展
+
+# CUDA 只读命令（所有安全级别都允许）
+CUDA_READONLY_COMMANDS = {
+    "info cuda threads",
+    "info cuda kernels",
+    "info cuda devices",
+    "info cuda exceptions",
+    "info cuda warps",
+    "info cuda lanes",
+    "info cuda managed",
+    "cuda kernel",        # 查看/切换焦点（只读操作）
+    "cuda block",
+    "cuda thread",
+    "cuda device",
+    "cuda sm",
+    "cuda warp",
+    "cuda lane",
+}
+
+# CUDA 写操作命令（需要 readwrite 或 full 级别）
+CUDA_WRITE_COMMANDS = {
+    "set cuda memcheck",
+    "set cuda software_preemption",
+    "set cuda break_on_launch",
+}
+
+# CUDA 始终禁止的命令
+CUDA_BLOCKED_COMMANDS = {
+    # 无额外禁止项，继承 gdb-cli 的 quit/kill/shell 禁止
+}
+```
+
+---
+
+## 7. CLI 命令注册
+
+### 7.1 新增 CUDA 子命令（Click）
+
+```python
+# cli.py 扩展
+
+@main.command("cuda-threads")
+@click.option("--session", "-s", required=True, help="会话 ID")
+@click.option("--kernel", "-k", type=int, help="按 Kernel 过滤")
+@click.option("--block", help="按 Block 过滤 (如 '0,0,0')")
+@click.option("--limit", default=50, help="最大返回数量")
+def cuda_threads_cmd(session, kernel, block, limit):
+    """列出 CUDA GPU 线程"""
+    with get_client(session) as client:
+        params = {"limit": limit}
+        if kernel is not None:
+            params["kernel"] = kernel
+        if block:
+            params["block"] = block
+        result = client.call("cuda_threads", **params)
+        print_json(result)
+
+
+@main.command("cuda-kernels")
+@click.option("--session", "-s", required=True, help="会话 ID")
+def cuda_kernels_cmd(session):
+    """列出活跃 CUDA Kernel"""
+    with get_client(session) as client:
+        result = client.call("cuda_kernels")
+        print_json(result)
+
+
+@main.command("cuda-focus")
+@click.option("--session", "-s", required=True, help="会话 ID")
+@click.option("--kernel", "-k", type=int, help="切换到指定 Kernel")
+@click.option("--block", help="切换到指定 Block (如 '2,3,0')")
+@click.option("--thread", help="切换到指定 Thread (如 '1,0,0')")
+def cuda_focus_cmd(session, kernel, block, thread):
+    """查看/切换 CUDA GPU 焦点"""
+    with get_client(session) as client:
+        params = {}
+        if kernel is not None:
+            params["kernel"] = kernel
+        if block:
+            params["block"] = block
+        if thread:
+            params["thread"] = thread
+        result = client.call("cuda_focus", **params)
+        print_json(result)
+
+
+@main.command("cuda-devices")
+@click.option("--session", "-s", required=True, help="会话 ID")
+def cuda_devices_cmd(session):
+    """查看 GPU 设备拓扑"""
+    with get_client(session) as client:
+        result = client.call("cuda_devices")
+        print_json(result)
+
+
+@main.command("cuda-exceptions")
+@click.option("--session", "-s", required=True, help="会话 ID")
+def cuda_exceptions_cmd(session):
+    """查看 CUDA 异常信息"""
+    with get_client(session) as client:
+        result = client.call("cuda_exceptions")
+        print_json(result)
+
+
+@main.command("cuda-memory")
+@click.option("--session", "-s", required=True, help="会话 ID")
+@click.option("--space", required=True,
+              type=click.Choice(["shared", "global", "local", "generic"]),
+              help="GPU 地址空间")
+@click.option("--expr", required=True, help="变量名或地址表达式")
+@click.option("--type", "element_type", default="int", help="元素类型 (int/float/double)")
+@click.option("--count", default=10, help="元素数量")
+def cuda_memory_cmd(session, space, expr, element_type, count):
+    """读取 GPU 地址空间内存"""
+    with get_client(session) as client:
+        result = client.call("cuda_memory",
+                             space=space, expr=expr,
+                             element_type=element_type, count=count)
+        print_json(result)
+```
+
+---
+
+## 8. Claude Code Skill 定义
+
+### 8.1 SKILL.md
 
 ```markdown
-## CUDA 调试工具
+---
+name: cuda-gdb-cli
+description: |
+  CUDA GPU debugging assistant that combines source code analysis with GPU runtime state.
+  Use this skill when the user wants to:
+  - Analyze CUDA core dumps or GPU crash dumps
+  - Debug running CUDA processes
+  - Investigate GPU kernel crashes, illegal memory access, warp exceptions
+  - Debug shared memory issues, thread divergence, or race conditions
+  Requires: cuda-gdb-cli (pip install cuda-gdb-cli) and cuda-gdb (CUDA Toolkit).
+---
 
-你可以使用 `cuda-gdb-cli` 命令行工具来调试 CUDA 程序。
+# CUDA GDB Debug Skill
 
-### 基本用法
+You are an expert CUDA debugger. Your job is to help users debug CUDA GPU programs
+by combining **source code analysis** with **GPU runtime state inspection**.
 
-1. **启动调试会话**
-   - Coredump: `cuda-gdb-cli start --exec <可执行文件> --core <coredump文件>`
-   - Live:     `cuda-gdb-cli start --exec <可执行文件> --args "<参数>"`
+## Core Principle
 
-2. **发送调试命令**
-   `cuda-gdb-cli send "<cuda-gdb命令>"`
+CUDA debugging requires THREE kinds of information:
+1. **Static Code**: Kernel source, launch parameters, memory allocation
+2. **CPU State**: Host-side call stacks, variables, thread states
+3. **GPU State**: Kernel threads, shared memory, warp exceptions, device topology
 
-3. **结束会话**
-   `cuda-gdb-cli stop`
+## Workflow
 
-### 常用调试命令
+### Step 1: Initialize Debug Session
 
-- `bt` — 查看调用栈
-- `info cuda threads` — 查看所有 GPU 线程
-- `cuda thread (x,y,z)` — 切换到指定 GPU 线程
-- `info locals` — 查看局部变量
-- `print <expr>` — 打印表达式
-- `info cuda kernels` — 查看所有 Kernel
-- `info cuda exceptions` — 查看 CUDA 异常
-- `break <file>:<line>` — 设置断点（仅 Live 模式）
-- `continue` / `next` / `step` — 执行控制（仅 Live 模式）
+**For CUDA core dump:**
+```bash
+cuda-gdb-cli load --binary <binary> --core <core> [--gdb-path cuda-gdb]
+```
 
-### 调试策略
+**For live CUDA process:**
 
-1. 先用 `bt` 和 `info cuda threads` 获取全局视图
-2. 切换到异常线程 `cuda thread (x,y,z)` 查看局部状态
-3. 用 `info locals` 和 `print` 检查变量值
-4. 如果是内存问题，检查数组索引是否越界
-5. 如果是 Warp 异常，用 `info cuda exceptions` 查看异常类型
+```bash
+cuda-gdb-cli attach --pid <pid> [--binary <binary>]
+```
+
+### Step 2: Gather GPU Overview
+
+```bash
+SESSION="<session_id>"
+
+# GPU 设备信息
+cuda-gdb-cli cuda-devices -s $SESSION
+
+# 活跃 Kernel 列表
+cuda-gdb-cli cuda-kernels -s $SESSION
+
+# GPU 线程概览
+cuda-gdb-cli cuda-threads -s $SESSION --limit 20
+
+# CUDA 异常
+cuda-gdb-cli cuda-exceptions -s $SESSION
+```
+
+### Step 3: Focus on Crash Point
+
+```bash
+# CPU 端调用栈
+cuda-gdb-cli bt -s $SESSION
+
+# 切换到异常 GPU 线程
+cuda-gdb-cli cuda-focus -s $SESSION --block "0,0,0" --thread "1,0,0"
+
+# 查看该线程的调用栈和局部变量
+cuda-gdb-cli bt -s $SESSION
+cuda-gdb-cli locals-cmd -s $SESSION
+```
+
+### Step 4: Correlate Source Code (CRITICAL)
+
+For each frame in the backtrace:
+
+1. **Read kernel source**: Use `Read` tool to get ±20 lines around crash point
+2. **Check launch parameters**: grid_dim, block_dim, shared memory size
+3. **Verify index calculations**: threadIdx, blockIdx, blockDim arithmetic
+4. **Check memory bounds**: array sizes vs computed indices
+
+### Step 5: Deep GPU Investigation
+
+```bash
+# 检查共享内存内容
+cuda-gdb-cli cuda-memory -s $SESSION --space shared --expr "smem" --type float --count 32
+
+# 检查全局内存
+cuda-gdb-cli cuda-memory -s $SESSION --space global --expr "d_output" --type int --count 10
+
+# 查看 GPU 寄存器
+cuda-gdb-cli registers -s $SESSION
+
+# 反汇编崩溃点
+cuda-gdb-cli disasm -s $SESSION --count 10
+
+# 检查多个 GPU 线程的状态
+cuda-gdb-cli cuda-threads -s $SESSION --kernel 0 --block "0,0,0"
+```
+
+### Step 6: Generate Analysis Report
+
+Structure findings as:
+
+```markdown
+## CUDA Debug Session Summary
+
+**Kernel**: `matmul_kernel<<<(32,32,1),(16,16,1)>>>`
+**Exception**: `CUDA_EXCEPTION_LANE_ILLEGAL_ADDRESS`
+**Crash Thread**: Block (0,0,0), Thread (1,0,0)
+
+### Crash Point
+`matmul.cu:28` — `C[row * N + col] = sum;`
+
+### Root Cause
+Thread (1,0,0) computed `row * N + col = 1024` which exceeds
+the allocated size of array C (1024 elements, valid indices 0-1023).
+
+### Evidence
+- `row = 0, col = 0, N = 1024, k = 1024`
+- The loop `for (k = 0; k <= N; k++)` should be `k < N`
+- Off-by-one error causes `k` to reach 1024
+
+### Fix
+Change `k <= N` to `k < N` at matmul.cu:25
+```
+
+## Common CUDA Debugging Patterns
+
+### Pattern: Illegal Memory Access
+
+**Indicators:** `CUDA_EXCEPTION_LANE_ILLEGAL_ADDRESS`
+**Investigation:**
+
+1. Check thread index calculations
+2. Verify array bounds
+3. Check shared memory bank conflicts
+
+### Pattern: Warp Divergence Issues
+
+**Indicators:** Performance problems, unexpected results
+**Investigation:**
+
+1. `cuda-gdb-cli cuda-warps` to check warp status
+2. Check conditional branches in kernel code
+
+### Pattern: Shared Memory Race Condition
+
+**Indicators:** Non-deterministic results
+**Investigation:**
+
+1. Check `__syncthreads()` placement
+2. Read shared memory from multiple threads
+3. Verify write-before-read ordering
+
+### Pattern: Kernel Launch Failure
+
+**Indicators:** No GPU threads visible
+**Investigation:**
+
+1. Check launch parameters (grid/block dimensions)
+2. Verify CUDA API return codes on host side
+3. Check GPU memory allocation
+
 ```
 
 ---
 
-## 8. 完整调试 Workflow 示例
-
-### 8.1 Coredump 分析 Workflow
-
-```bash
-# Step 1: 启动
-$ cuda-gdb-cli start --exec ./matmul --core ./core.99421
-[cuda-gdb-cli] Session started
-  Session ID : s_f7e2a1
-  Mode       : coredump
-  Status     : ready
-
-# Step 2: 查看崩溃调用栈
-$ cuda-gdb-cli send "bt"
->>> bt
-#0  matmul_kernel<<<(32,32,1),(16,16,1)>>> (A=0x7f..., B=0x7f..., C=0x7f..., N=1024)
-    at matmul.cu:28
-#1  0x00007f4a3c2... in ?? ()
-
-# Step 3: 查看 GPU 线程状态
-$ cuda-gdb-cli send "info cuda threads"
->>> info cuda threads
-  BlockIdx    ThreadIdx  To  Name           Filename   Line
-* (0,0,0)     (0,0,0)   -   matmul_kernel  matmul.cu  28
-  (0,0,0)     (1,0,0)   -   matmul_kernel  matmul.cu  28
-  ...
-  (31,31,0)   (15,15,0) -   matmul_kernel  matmul.cu  28
-
-# Step 4: 检查崩溃线程的局部变量
-$ cuda-gdb-cli send "info locals"
->>> info locals
-row = 0
-col = 0
-sum = 0
-k = 1024
-
-# Step 5: 检查可疑的索引计算
-$ cuda-gdb-cli send "print row * N + col"
->>> print row * N + col
-$1 = 0
-
-$ cuda-gdb-cli send "print A[row * N + k]"
->>> print A[row * N + k]
-Cannot access memory at address 0x7f4a3c000000
-
-# Step 6: 确认越界 → k=1024 但 N=1024，A[row*1024+1024] 越界
-$ cuda-gdb-cli send "print N"
->>> print N
-$2 = 1024
-
-# Step 7: 结束
-$ cuda-gdb-cli stop
-[cuda-gdb-cli] Session s_f7e2a1 terminated.
-```
-
-### 8.2 Live 调试 Workflow
-
-```bash
-# Step 1: 启动 Live 调试
-$ cuda-gdb-cli start --exec ./vector_add --args "1000000"
-[cuda-gdb-cli] Session started
-  Session ID : s_b3c4d5
-  Mode       : live
-  Status     : ready
-
-# Step 2: 设置条件断点
-$ cuda-gdb-cli send "break vector_add.cu:15 if threadIdx.x == 255"
->>> break vector_add.cu:15 if threadIdx.x == 255
-Breakpoint 1 at 0x... : file vector_add.cu, line 15.
-
-# Step 3: 运行
-$ cuda-gdb-cli send "run"
->>> run
-[Switching focus to CUDA kernel 0, grid 1, block (0,0,0), thread (255,0,0)]
-Breakpoint 1, vector_add_kernel at vector_add.cu:15
-
-# Step 4: 检查状态
-$ cuda-gdb-cli send "info locals" "print idx" "print a[idx]"
->>> info locals
-idx = 255
->>> print idx
-$1 = 255
->>> print a[idx]
-$2 = 255.0
-
-# Step 5: 单步执行
-$ cuda-gdb-cli send "next"
->>> next
-16        c[idx] = a[idx] + b[idx];
-
-$ cuda-gdb-cli send "print c[idx]"
->>> print c[idx]
-$3 = 510.0
-
-# Step 6: 继续执行到结束
-$ cuda-gdb-cli send "continue"
->>> continue
-[Inferior 1 (process 12345) exited normally]
-
-# Step 7: 结束
-$ cuda-gdb-cli stop
-[cuda-gdb-cli] Session s_b3c4d5 terminated.
-```
-
----
-
-## 9. 项目结构
+## 9. 项目结构（fork 后）
 
 ```
-cuda-gdb-cli/
-├── pyproject.toml              # 项目配置与依赖
-├── README.md                   # 使用文档
+
+cuda-gdb-cli/                          # fork from Cerdore/gdb-cli
+├── pyproject.toml                     # 改名 gdb-cli → cuda-gdb-cli
+├── README.md
 ├── src/
-│   └── cuda_gdb_cli/
+│   └── cuda_gdb_cli/                  # 改名 gdb_cli → cuda_gdb_cli
 │       ├── __init__.py
-│       ├── __main__.py         # CLI 入口 (python -m cuda_gdb_cli)
-│       ├── cli.py              # argparse 命令解析
-│       ├── daemon.py           # CudaGdbDaemon（后台进程，持有 cuda-gdb）
-│       ├── client.py           # CudaGdbClient（CLI 前端，连接 Daemon）
-│       ├── session.py          # SessionManager（会话状态管理）
-│       ├── output.py           # OutputFormatter（text/json 格式化）
-│       └── prompt.py           # cuda-gdb 提示符检测与交互处理
+│       ├── cli.py                     # ← 新增 cuda-* 子命令
+│       ├── client.py                  # 无改动
+│       ├── launcher.py                # ← gdb → cuda-gdb
+│       ├── session.py                 # ← 新增 CUDA 元数据
+│       ├── safety.py                  # ← 新增 CUDA 命令白名单
+│       ├── formatters.py              # 无改动
+│       ├── errors.py                  # ← 新增 CUDA 错误类型
+│       ├── env_check.py               # ← 新增 CUDA 环境检查
+│       └── gdb_server/
+│           ├── gdb_rpc_server.py      # ← 注册 CUDA handler
+│           ├── handlers.py            # 无改动（CPU handler）
+│           ├── cuda_handlers.py       # ← 新增：8 个 CUDA handler
+│           ├── value_formatter.py     # ← 扩展地址空间
+│           └── heartbeat.py           # 无改动
+├── skills/
+│   └── cuda-gdb-cli/                  # ← 新增 CUDA Skill
+│       ├── SKILL.md
+│       └── evals/
 ├── tests/
 │   ├── test_cli.py
-│   ├── test_daemon.py
-│   └── test_prompt.py
-└── examples/
-    ├── agent_prompt.md         # Agent System Prompt 模板
-    └── workflows/
-        ├── coredump_analysis.sh
-        └── live_debug.sh
+│   ├── test_cuda_handlers.py          # ← 新增
+│   └── crash_test/
+│       ├── cuda_crash_test.cu         # ← 新增 CUDA 测试程序
+│       └── Makefile
+└── docs/
+    └── cuda-gdb-commands.md           # ← CUDA 命令速查
+
 ```
 
 ---
 
-## 10. 与其他方案的对比
+## 10. Agent 使用示例（完整 Workflow）
 
-| 维度                     | cuda-gdb-cli (本方案) |         RPC 服务方案         |     直接调用 cuda-gdb     |
-| ------------------------ | :-------------------: | :--------------------------: | :------------------------: |
-| **Agent 集成难度** | ⭐ 极低（bash 命令） | ⭐⭐⭐ 高（需要 RPC 客户端） | ⭐⭐ 中（需处理交互式 IO） |
-| **部署复杂度**     |    `pip install`    |         需要启动服务         |          无需安装          |
-| **会话管理**       |    自动（Daemon）    |           需要实现           |      无（每次新进程）      |
-| **交互式提示处理** |         自动         |           需要实现           |          手动处理          |
-| **多会话支持**     |     ✅ session-id     |              ✅              |             ❌             |
-| **输出格式**       |      text + JSON      |             JSON             |          原始文本          |
-| **学习成本**       |       4 个命令       |       学习 API Schema       |       学习 GDB 交互       |
+### 10.1 Coredump 分析
 
-**本方案的核心优势：Agent 不需要学任何新东西，它已经会用 bash，那就够了。**
+```bash
+# 1. 加载 CUDA coredump
+$ cuda-gdb-cli load --binary ./matmul --core ./core.99421
+{"session_id": "f465d650", "mode": "core", "status": "started"}
+
+$ SESSION="f465d650"
+
+# 2. GPU 概览
+$ cuda-gdb-cli cuda-devices -s $SESSION
+{"devices": [{"device_id": 0, "name": "NVIDIA A100", "sm_count": 108}]}
+
+$ cuda-gdb-cli cuda-kernels -s $SESSION
+{"kernels": [{"kernel_id": 0, "function": "matmul_kernel",
+              "grid_dim": [32,32,1], "block_dim": [16,16,1]}]}
+
+# 3. 查看异常
+$ cuda-gdb-cli cuda-exceptions -s $SESSION
+{"exceptions": [{"kernel": 0, "block_idx": [0,0,0], "thread_idx": [1,0,0],
+                 "exception": "CUDA_EXCEPTION_LANE_ILLEGAL_ADDRESS"}]}
+
+# 4. 切换到异常线程
+$ cuda-gdb-cli cuda-focus -s $SESSION --block "0,0,0" --thread "1,0,0"
+{"focus": {"kernel": 0, "block_idx": [0,0,0], "thread_idx": [1,0,0]},
+ "frame": {"function": "matmul_kernel", "file": "matmul.cu", "line": 28}}
+
+# 5. 查看调用栈和局部变量
+$ cuda-gdb-cli bt -s $SESSION --full
+{"frames": [{"number": 0, "function": "matmul_kernel", "file": "matmul.cu",
+             "line": 28, "locals": [{"name": "k", "value": 1024}]}]}
+
+# 6. 检查变量
+$ cuda-gdb-cli eval-cmd -s $SESSION "row * N + k"
+{"expression": "row * N + k", "value": 1024, "type": "int"}
+
+# 7. 检查共享内存
+$ cuda-gdb-cli cuda-memory -s $SESSION --space shared --expr "tile_A" --type float --count 16
+{"space": "shared", "elements": [1.0, 2.0, 3.0, ...]}
+
+# 8. 结束
+$ cuda-gdb-cli stop -s $SESSION
+{"session_id": "f465d650", "status": "stopped"}
+```
+
+### 10.2 Live Attach 调试
+
+```bash
+# 1. Attach 到运行中的 CUDA 进程
+$ cuda-gdb-cli attach --pid 9876 --binary ./training_app
+{"session_id": "a1b2c3d4", "mode": "attach", "status": "started"}
+
+$ SESSION="a1b2c3d4"
+
+# 2. 查看当前 GPU 状态
+$ cuda-gdb-cli cuda-kernels -s $SESSION
+$ cuda-gdb-cli cuda-threads -s $SESSION --limit 10
+
+# 3. 设置条件断点（通过 exec 透传）
+$ cuda-gdb-cli exec -s $SESSION "break kernel.cu:42 if threadIdx.x == 0" --safety-level full
+{"command": "break kernel.cu:42 if threadIdx.x == 0", "output": "Breakpoint 1 at ..."}
+
+# 4. 继续执行
+$ cuda-gdb-cli exec -s $SESSION "continue" --safety-level full
+
+# 5. 命中断点后检查状态
+$ cuda-gdb-cli cuda-focus -s $SESSION
+$ cuda-gdb-cli locals-cmd -s $SESSION
+$ cuda-gdb-cli eval-cmd -s $SESSION "blockDim.x * blockIdx.x + threadIdx.x"
+
+# 6. Detach
+$ cuda-gdb-cli stop -s $SESSION
+```
 
 ---
 
-## 11. 演进路线
+## 11. 与 gdb-cli 的改动清单
 
-### Phase 1: MVP（2 周）
+### 11.1 改动文件汇总
 
-- [X] `start` / `send` / `stop` / `status` 四个核心命令
-- [X] Coredump 模式支持
-- [X] pexpect 进程管理 + 提示符检测
-- [X] 纯文本输出
+| 文件                             | 改动类型       | 改动内容                                                   |
+| -------------------------------- | -------------- | ---------------------------------------------------------- |
+| `pyproject.toml`               | 修改           | 包名 `gdb-cli` → `cuda-gdb-cli`，新增 CUDA 相关元数据 |
+| `cli.py`                       | 扩展           | 新增 8 个 `cuda-*` 子命令                                |
+| `launcher.py`                  | 修改           | 默认 `gdb_path` 改为 `cuda-gdb`，新增 CUDA 启动参数    |
+| `session.py`                   | 扩展           | SessionMeta 新增 `cuda_version`, `gpu_device` 字段     |
+| `safety.py`                    | 扩展           | 新增 CUDA 命令白名单                                       |
+| `env_check.py`                 | 扩展           | 新增 cuda-gdb、CUDA Toolkit、GPU 驱动检查                  |
+| `errors.py`                    | 扩展           | 新增 `CUDAError`, `CUDAMemoryError` 等                 |
+| `gdb_rpc_server.py`            | 扩展           | 注册 CUDA handler                                          |
+| `value_formatter.py`           | 扩展           | 地址空间修饰符处理                                         |
+| `cuda_handlers.py`             | **新增** | 8 个 CUDA handler 实现                                     |
+| `skills/cuda-gdb-cli/SKILL.md` | **新增** | CUDA 调试 Skill 定义                                       |
 
-### Phase 2: 增强（2 周）
+### 11.2 不改动的文件
 
-- [ ] Live 调试模式（attach / launch）
-- [ ] JSON 输出格式
-- [ ] Daemon 模式（跨 CLI 调用的会话持久化）
-- [ ] 多会话支持
+| 文件              | 原因                                      |
+| ----------------- | ----------------------------------------- |
+| `client.py`     | 通用 Unix Socket 客户端，与调试器类型无关 |
+| `formatters.py` | JSON 输出格式化，与调试器类型无关         |
+| `heartbeat.py`  | 心跳超时机制，与调试器类型无关            |
+| `handlers.py`   | CPU 端 handler 在 cuda-gdb 中同样可用     |
 
-### Phase 3: Agent 优化（2 周）
+---
 
-- [ ] `doctor` 环境检查命令
-- [ ] 智能超时（根据命令类型自动调整）
-- [ ] 输出截断保护（超长输出自动摘要）
-- [ ] Agent System Prompt 模板库
+## 12. 演进路线
 
-### Phase 4: 可选扩展
+### Phase 1: Fork + 基础 CUDA 支持（2 周）
 
-- [ ] MCP Server 封装（如果需要与 MCP 生态集成）
-- [ ] Web UI（可视化调试面板）
-- [ ] 远程调试支持（SSH 隧道）
+- [ ] Fork gdb-cli，改名为 cuda-gdb-cli
+- [ ] launcher.py: gdb → cuda-gdb
+- [ ] 新增 `cuda_handlers.py`：`cuda_threads`, `cuda_kernels`, `cuda_focus`, `cuda_exceptions`
+- [ ] CLI 注册 4 个核心 CUDA 子命令
+- [ ] env_check.py 扩展 CUDA 环境检查
+- [ ] Coredump 模式端到端验证
+
+### Phase 2: 完整 CUDA 能力（2 周）
+
+- [ ] 新增 `cuda_memory`, `cuda_devices`, `cuda_warps`, `cuda_lanes` handler
+- [ ] value_formatter.py 扩展地址空间支持
+- [ ] safety.py 扩展 CUDA 命令白名单
+- [ ] Live Attach 模式验证
+- [ ] 完善 CUDA 异常类型映射
+
+### Phase 3: Agent 集成（1 周）
+
+- [ ] 编写 Claude Code Skill（SKILL.md）
+- [ ] 编写 CUDA 调试命令速查文档
+- [ ] 端到端 Skill 测试（coredump + live attach）
+
+### Phase 4: 上游贡献（可选）
+
+- [ ] 向 gdb-cli 提交 PR，将 CUDA 支持作为可选扩展合入上游
+- [ ] 或维护独立 fork，定期同步上游更新
